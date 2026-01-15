@@ -1,12 +1,13 @@
 {
+  "functions": {
+    "api/convert.py": {
+      "maxDuration": 60
+    }
+  },
   "builds": [
     {
       "src": "api/convert.py",
       "use": "@vercel/python"
-    },
-    {
-      "src": "index.html",
-      "use": "@vercel/static"
     }
   ],
   "routes": [

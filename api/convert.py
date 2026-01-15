@@ -1,37 +1,43 @@
+from flask import Flask, request, jsonify
 import io
 import re
 import math
 import zipfile
 import base64
-import json
-from http.server import BaseHTTPRequestHandler
-import pdfplumber
+from pdfminer.high_level import extract_text
+
+app = Flask(__name__)
 
 
-def extract_coordinates_from_pdf(pdf_bytes: bytes) -> list:
+def extract_coordinates_from_pdf(pdf_bytes):
     coordinates = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
+    try:
+        full_text = extract_text(io.BytesIO(pdf_bytes))
 
-    pattern = r'^(\d+)\s+([\d.]+)\s+([\d.]+)\s*$'
-    for line in full_text.split('\n'):
-        line = line.strip()
-        match = re.match(pattern, line)
-        if match:
+        pattern = r'(\d+)\s+(4\d{5}[\d.]*)\s+(4\d{6}[\d.]*)'
+        for match in re.finditer(pattern, full_text):
             seq = int(match.group(1))
             x = float(match.group(2))
             y = float(match.group(3))
             if 400000 < x < 500000 and 4000000 < y < 5000000:
                 coordinates.append((seq, x, y))
-    coordinates.sort(key=lambda c: c[0])
+
+        coordinates.sort(key=lambda c: c[0])
+        # Remove duplicates
+        seen = set()
+        unique = []
+        for c in coordinates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        coordinates = unique
+
+    except Exception as e:
+        print(f"PDF error: {e}")
     return coordinates
 
 
-def convert_to_txt_format(coordinates: list) -> str:
+def convert_to_txt_format(coordinates):
     if not coordinates:
         return ""
     total_points = len(coordinates)
@@ -43,53 +49,68 @@ def convert_to_txt_format(coordinates: list) -> str:
     return '\n'.join(lines)
 
 
-def process_zip(zip_bytes: bytes) -> bytes:
+def process_zip(zip_bytes):
     output_buffer = io.BytesIO()
+    file_count = 0
+    errors = []
+
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as input_zip:
         with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as output_zip:
             for filename in input_zip.namelist():
-                if filename.lower().endswith('.pdf'):
-                    pdf_bytes = input_zip.read(filename)
-                    coords = extract_coordinates_from_pdf(pdf_bytes)
-                    if coords:
-                        txt_content = convert_to_txt_format(coords)
-                        txt_filename = filename.rsplit('.', 1)[0] + '.txt'
-                        if '/' in txt_filename:
-                            txt_filename = txt_filename.split('/')[-1]
-                        output_zip.writestr(txt_filename, txt_content.encode('utf-8'))
+                if filename.lower().endswith('.pdf') and not filename.startswith('__MACOSX'):
+                    try:
+                        pdf_bytes = input_zip.read(filename)
+                        coords = extract_coordinates_from_pdf(pdf_bytes)
+                        if coords:
+                            txt_content = convert_to_txt_format(coords)
+                            txt_filename = filename.rsplit('.', 1)[0] + '.txt'
+                            if '/' in txt_filename:
+                                txt_filename = txt_filename.split('/')[-1]
+                            output_zip.writestr(txt_filename, txt_content.encode('utf-8'))
+                            file_count += 1
+                    except Exception as e:
+                        errors.append(f"{filename}: {str(e)}")
+
     output_buffer.seek(0)
-    return output_buffer.getvalue()
+    return output_buffer.getvalue(), file_count, errors
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
+@app.route('/api/convert', methods=['POST', 'OPTIONS'])
+def convert():
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
 
-        try:
-            data = json.loads(post_data)
-            zip_base64 = data.get('file', '')
-            zip_bytes = base64.b64decode(zip_base64)
+    try:
+        data = request.get_json(force=True)
+        if not data or 'file' not in data:
+            return jsonify({'error': 'No file provided'}), 400
 
-            result_zip = process_zip(zip_bytes)
-            result_base64 = base64.b64encode(result_zip).decode('utf-8')
+        zip_base64 = data['file']
+        zip_bytes = base64.b64decode(zip_base64)
 
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps({'file': result_base64}).encode())
+        result_zip, count, errors = process_zip(zip_bytes)
 
-        except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
+        if count == 0:
+            err_msg = 'No valid PDFs found'
+            if errors:
+                err_msg += ': ' + '; '.join(errors[:3])
+            return jsonify({'error': err_msg}), 400
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+        result_base64 = base64.b64encode(result_zip).decode('utf-8')
+
+        response = jsonify({'file': result_base64, 'count': count})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    except zipfile.BadZipFile:
+        return jsonify({'error': 'Invalid ZIP file'}), 400
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+# Vercel serverless handler
+app.debug = False

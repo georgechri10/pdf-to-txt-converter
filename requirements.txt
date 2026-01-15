@@ -1,1 +1,2 @@
-pdfplumber>=0.10.0
+flask>=2.0.0
+pdfminer.six>=20221105
