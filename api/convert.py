@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 import io
+import ntpath
+import posixpath
 import re
 import math
 import zipfile
@@ -7,6 +9,15 @@ import base64
 from pdfminer.high_level import extract_text
 
 app = Flask(__name__)
+
+
+def safe_basename(filename):
+    """Safely extract just the filename, handling both Unix and Windows path separators."""
+    # First handle forward slashes (Unix paths)
+    filename = posixpath.basename(filename)
+    # Then handle backslashes (Windows paths)
+    filename = ntpath.basename(filename)
+    return filename
 
 
 def extract_coordinates_from_pdf(pdf_bytes):
@@ -77,9 +88,8 @@ def process_zip(zip_bytes):
                         coords = extract_coordinates_from_pdf(pdf_bytes)
                         if coords:
                             txt_content = convert_to_txt_format(coords)
-                            txt_filename = filename.rsplit('.', 1)[0] + '.txt'
-                            if '/' in txt_filename:
-                                txt_filename = txt_filename.split('/')[-1]
+                            # Use safe_basename to safely extract filename and prevent path traversal
+                            txt_filename = safe_basename(filename.rsplit('.', 1)[0] + '.txt')
                             output_zip.writestr(txt_filename, txt_content.encode('utf-8'))
                             file_count += 1
                     except Exception as e:
