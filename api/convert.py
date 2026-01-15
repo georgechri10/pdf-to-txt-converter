@@ -10,46 +10,60 @@ app = Flask(__name__)
 
 
 def extract_coordinates_from_pdf(pdf_bytes):
+    """Extract coordinates from cadastral PDF."""
     coordinates = []
     try:
         full_text = extract_text(io.BytesIO(pdf_bytes))
 
-        pattern = r'(\d+)\s+(4\d{5}[\d.]*)\s+(4\d{6}[\d.]*)'
-        for match in re.finditer(pattern, full_text):
-            seq = int(match.group(1))
-            x = float(match.group(2))
-            y = float(match.group(3))
-            if 400000 < x < 500000 and 4000000 < y < 5000000:
-                coordinates.append((seq, x, y))
+        # Find where X column starts (after "X" header)
+        # Then find Y column (after "Y" header or after X values)
+        # Table values have exactly 2 decimal places
 
-        coordinates.sort(key=lambda c: c[0])
-        # Remove duplicates
-        seen = set()
-        unique = []
-        for c in coordinates:
-            if c not in seen:
-                seen.add(c)
-                unique.append(c)
-        coordinates = unique
+        # Pattern: exactly 6 digits with 2 decimals for X (41XXXX.XX)
+        # Pattern: exactly 7 digits with 2 decimals for Y (449XXXX.XX)
+
+        x_pattern = r'\b(41\d{4}\.\d{2})\b'
+        y_pattern = r'\b(449\d{4}\.\d{2})\b'
+
+        # Find all matches in order
+        x_coords = re.findall(x_pattern, full_text)
+        y_coords = re.findall(y_pattern, full_text)
+
+        # Pair them up (keep all, including closing point duplicates)
+        min_len = min(len(x_coords), len(y_coords))
+
+        for i in range(min_len):
+            x = float(x_coords[i])
+            y = float(y_coords[i])
+            coordinates.append((i, x, y))
 
     except Exception as e:
         print(f"PDF error: {e}")
+
     return coordinates
 
 
 def convert_to_txt_format(coordinates):
+    """Convert coordinates to output TXT format."""
     if not coordinates:
         return ""
+
     total_points = len(coordinates)
     first_id = math.ceil(total_points / 10) * 10
+
     lines = []
     for i, (seq, x, y) in enumerate(coordinates):
-        point_id = f"{first_id:02d}" if i == 0 else f"{seq:02d}"
+        if i == 0:
+            point_id = f"{first_id:02d}"
+        else:
+            point_id = f"{i:02d}"
         lines.append(f"{point_id},{x:.2f},{y:.2f},0.00,KTHMA")
+
     return '\n'.join(lines)
 
 
 def process_zip(zip_bytes):
+    """Process ZIP file containing PDFs."""
     output_buffer = io.BytesIO()
     file_count = 0
     errors = []
@@ -112,5 +126,5 @@ def convert():
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 
-# Vercel serverless handler
-app.debug = False
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
