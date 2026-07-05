@@ -1,19 +1,19 @@
 {
   "functions": {
-    "api/convert.py": {
-      "maxDuration": 60
+    "api/ask.py": {
+      "maxDuration": 30
     }
   },
   "builds": [
     {
-      "src": "api/convert.py",
+      "src": "api/ask.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
-      "src": "/api/convert",
-      "dest": "/api/convert.py"
+      "src": "/api/ask",
+      "dest": "/api/ask.py"
     },
     {
       "src": "/(.*)",
