@@ -1,5 +1,12 @@
 {
   "tasks": {
     "start": "deno run --allow-net --allow-env --allow-read main.ts"
+  },
+  "deploy": {
+    "org": "georgechri10",
+    "app": "sharpodds"
   }
 }
+
+
+
