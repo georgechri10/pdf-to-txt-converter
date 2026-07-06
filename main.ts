@@ -65,6 +65,53 @@ function rank(message: string, candidates: Market[]): Market[] {
     .map((x) => x.c);
 }
 
+// Use the model's sports knowledge to turn a loose question into concrete
+// search queries, adding the league/competition it can infer. This bridges
+// ambiguous phrasings ("who wins the World Series" -> "MLB World Series
+// champion") to Polymarket's text search, which is otherwise easily misled.
+async function expandQueries(message: string): Promise<string[]> {
+  const base = cleanQuery(message);
+  const key = Deno.env.get("DEEPSEEK_API_KEY");
+  if (!key) return [base];
+  try {
+    const r = await fetch(DEEPSEEK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Rewrite a sports betting question into up to 2 short search queries " +
+              "for a prediction market. Add the league/competition/sport name you can " +
+              "infer (e.g. 'World Series' -> 'MLB World Series champion'; 'the Ashes' " +
+              "-> 'cricket Ashes winner'). Keep proper nouns (teams, players). " +
+              'Reply ONLY with compact JSON {"queries": ["..."]}.',
+          },
+          { role: "user", content: message },
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" },
+        max_tokens: 80,
+      }),
+    });
+    if (!r.ok) return [base];
+    const resp = await r.json();
+    const parsed = JSON.parse(resp.choices[0].message.content);
+    const qs = (parsed.queries ?? []).filter(
+      (s: unknown) => typeof s === "string" && s.trim(),
+    ) as string[];
+    return qs.length ? Array.from(new Set([...qs, base])) : [base];
+  } catch {
+    return [base];
+  }
+}
+
 async function searchMarkets(message: string): Promise<Market[]> {
   const seen = new Set<string>();
   const candidates: Market[] = [];
@@ -109,8 +156,9 @@ async function searchMarkets(message: string): Promise<Market[]> {
     }
   }
 
-  await collect(cleanQuery(message));
-  if (!candidates.length && cleanQuery(message) !== message.trim()) {
+  const queries = await expandQueries(message);
+  await Promise.all(queries.map(collect));
+  if (!candidates.length && !queries.includes(message.trim())) {
     await collect(message.trim());
   }
   return rank(message, candidates);
@@ -144,18 +192,21 @@ async function deepseekPick(message: string, candidates: Market[]) {
 
   const listing = candidates
     .map((c, i) =>
-      `[${i}] event: ${c.event} | market: ${c.question} | outcomes: ${JSON.stringify(c.outcomes)}`
+      `[${i}] event: ${c.event} | market: ${c.question} | outcomes: ${JSON.stringify(c.outcomes)} | p0: ${c.prices[0]}`
     )
     .join("\n");
   const system =
     "You match a sports/betting question to the correct Polymarket market from the list. " +
     "Markets span match winners, totals (over/under), awards (MVP, Golden Boot, top " +
     "scorer, most assists), player-goal milestones and head-to-heads. Most are Yes/No. " +
+    "Each market lists p0 = the probability of its FIRST outcome. " +
     "Notation: in 'A vs B 1' the 1 means the first team (A) to win, 2 the second team (B), " +
     "X a draw. Reply ONLY with compact JSON: " +
     '{"index": <int>, "outcome": "<exact outcome string the user is asking about>"}. ' +
-    "Pick the single market that best answers the question; for a Yes/No prop the outcome " +
-    "is usually \"Yes\" unless the user implies the negative. If nothing fits, use index -1.";
+    "Rules: (a) if the question names a specific competitor/pick, choose the market matching " +
+    "it; for a Yes/No prop the outcome is usually \"Yes\". (b) if the question is a generic " +
+    "outright with NO named competitor (e.g. 'who wins the World Series', 'NBA MVP'), choose " +
+    "the single market with the highest p0 — the favourite. (c) if nothing fits, use index -1.";
   const user = `Question: ${message}\n\nMarkets:\n${listing}`;
 
   try {
