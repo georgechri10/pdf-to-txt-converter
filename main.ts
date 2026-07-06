@@ -41,6 +41,30 @@ async function getJson(url: string) {
   return r.json();
 }
 
+// A market that has already resolved reports one outcome at ~1 and the rest
+// at ~0. Those aren't tradeable, so drop them from the candidate pool.
+function isSettled(prices: number[]): boolean {
+  return prices.some((p) => p >= 0.9995 || p <= 0.0005);
+}
+
+// Rank candidates by token overlap with the question so the relevant markets
+// survive the cap even when a single event contains dozens of sub-markets
+// (Golden Boot has 80, MVP has 51, ...).
+const MAX_CANDIDATES = 40;
+function rank(message: string, candidates: Market[]): Market[] {
+  const q = tokens(message);
+  return candidates
+    .map((c) => {
+      const ct = tokens(`${c.question} ${c.event} ${c.outcomes.join(" ")}`);
+      let score = 0;
+      for (const w of q) if (ct.has(w)) score++;
+      return { c, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_CANDIDATES)
+    .map((x) => x.c);
+}
+
 async function searchMarkets(message: string): Promise<Market[]> {
   const seen = new Set<string>();
   const candidates: Market[] = [];
@@ -49,7 +73,7 @@ async function searchMarkets(message: string): Promise<Market[]> {
     if (!query) return;
     const url = `${GAMMA_SEARCH}?${new URLSearchParams({
       q: query,
-      limit_per_type: "8",
+      limit_per_type: "20",
       events_status: "active",
     })}`;
     let data;
@@ -70,6 +94,7 @@ async function searchMarkets(message: string): Promise<Market[]> {
           continue;
         }
         if (outcomes.length < 2 || outcomes.length !== prices.length) continue;
+        if (isSettled(prices)) continue;
         seen.add(mid);
         candidates.push({
           id: mid,
@@ -85,8 +110,10 @@ async function searchMarkets(message: string): Promise<Market[]> {
   }
 
   await collect(cleanQuery(message));
-  if (!candidates.length) await collect(message.trim());
-  return candidates.slice(0, 25);
+  if (!candidates.length && cleanQuery(message) !== message.trim()) {
+    await collect(message.trim());
+  }
+  return rank(message, candidates);
 }
 
 // --------------------------------------------------------------------------- //
@@ -121,11 +148,14 @@ async function deepseekPick(message: string, candidates: Market[]) {
     )
     .join("\n");
   const system =
-    "You match a sports/betting question to the correct Polymarket market. " +
-    "Notation: in 'A vs B 1' the 1 means the first team (A) to win, 2 the second " +
-    "team (B), X a draw. Reply ONLY with compact JSON: " +
+    "You match a sports/betting question to the correct Polymarket market from the list. " +
+    "Markets span match winners, totals (over/under), awards (MVP, Golden Boot, top " +
+    "scorer, most assists), player-goal milestones and head-to-heads. Most are Yes/No. " +
+    "Notation: in 'A vs B 1' the 1 means the first team (A) to win, 2 the second team (B), " +
+    "X a draw. Reply ONLY with compact JSON: " +
     '{"index": <int>, "outcome": "<exact outcome string the user is asking about>"}. ' +
-    "Pick the single market that best answers the question. If none fit, use index -1.";
+    "Pick the single market that best answers the question; for a Yes/No prop the outcome " +
+    "is usually \"Yes\" unless the user implies the negative. If nothing fits, use index -1.";
   const user = `Question: ${message}\n\nMarkets:\n${listing}`;
 
   try {
