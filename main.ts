@@ -57,9 +57,33 @@ function isSettled(prices: number[]): boolean {
 // a user actually wants under plain token overlap, burying it. These are
 // never what "the odds of an event" means, so drop the whole family.
 function isNoveltyMarket(eventTitle: string, question: string): boolean {
-  return /announcers? say|broadcast(er)?s? say/i.test(
+  return /announcers? say|broadcast(er)?s? say|what will be said/i.test(
     `${eventTitle} ${question}`,
   );
+}
+
+// Every market inside a "what will the announcers/broadcast say" event is a
+// novelty market (confirmed: these events are homogeneous, never mixed with
+// real betting markets), so the whole event can be skipped up front — before
+// its slug/title/gameId get recorded. Recording them anyway let a novelty
+// event's generic, team-name-laden title (which still ties or beats the
+// real match's title on token overlap) starve the actual match's slug out
+// of the capped "which events deserve a sibling-market lookup" ranking.
+function isNoveltyEvent(eventTitle: string): boolean {
+  return /announcers? say|broadcast(er)?s? say|what will be said/i.test(
+    eventTitle,
+  );
+}
+
+// Tournaments with brackets that aren't fully seeded yet carry literal
+// placeholder markets ("Will A win the EWC Valorant Tournament", "Team AG",
+// "Country A", "Any Other Team") standing in for a not-yet-determined slot.
+// A generic outright question ("who wins X") has no name to match against,
+// so the favourite-price fallback can pick one of these over a real team —
+// they're never a real answer, so drop them.
+function isPlaceholderMarket(question: string): boolean {
+  return /\bwill (team |country )?[a-z]{1,2}\b (win|be |reach |advance)|\bany other team\b|\banother team\b/i
+    .test(question);
 }
 
 // Rank candidates by token overlap with the question so the relevant markets
@@ -145,7 +169,7 @@ async function expandQueries(message: string): Promise<string[]> {
 // The base event IS found by search, so once we have its slug we can fetch
 // the sibling directly instead of guessing further search phrasings.
 const PROP_HINT =
-  /\b(over|under|o\/u|total|totals|corner|card|handicap|spread|advance|prop|props|both teams|btts|exact score|score|half|halftime|half-time|extra time|penalt(y|ies)|first (team )?to score)\b/i;
+  /\b(over|under|o\/u|total|totals|corner|card|handicap|spread|ats|run ?line|puck ?line|moneyline|money ?line|ml|advance|qualif\w*|prop|props|both teams|btts|exact score|correct score|score|half|halftime|half-time|ht\/ft|extra time|penalt(y|ies)|first (team )?to score)\b/i;
 // A point-spread question is often written as bare notation ("France -2.5"
 // vs Morocco) with no describing word at all — catch that shape too.
 const SPREAD_NOTATION = /[+-]\d+(\.\d)?\b/;
@@ -219,6 +243,7 @@ async function searchMarkets(message: string): Promise<Market[]> {
   const gameIdBySlug = new Map<string, string>();
 
   function ingest(event: GammaEvent) {
+    if (isNoveltyEvent(event.title ?? "")) return;
     if (event.slug && !eventTitleBySlug.has(event.slug)) {
       eventTitleBySlug.set(event.slug, event.title ?? "");
       if (event.gameId) gameIdBySlug.set(event.slug, event.gameId);
@@ -239,6 +264,7 @@ async function searchMarkets(message: string): Promise<Market[]> {
       if (isNoveltyMarket(event.title ?? "", (m.question as string) ?? "")) {
         continue;
       }
+      if (isPlaceholderMarket((m.question as string) ?? "")) continue;
       seen.add(mid);
       candidates.push({
         id: mid,
@@ -315,10 +341,8 @@ function fallbackPick(message: string, candidates: Market[]) {
   return { index: best, outcome: candidates[best].outcomes[0] };
 }
 
-async function deepseekPick(message: string, candidates: Market[]) {
-  const key = Deno.env.get("DEEPSEEK_API_KEY");
-  if (!key) return fallbackPick(message, candidates);
-
+async function deepseekPickOnce(message: string, candidates: Market[]) {
+  const key = Deno.env.get("DEEPSEEK_API_KEY")!;
   const listing = candidates
     .map((c, i) =>
       `[${i}] event: ${c.event} | market: ${c.question} | outcomes: ${
@@ -336,35 +360,55 @@ async function deepseekPick(message: string, candidates: Market[]) {
     '{"index": <int>, "outcome": "<exact outcome string the user is asking about>"}. ' +
     "Rules: (a) if the question names a specific competitor/pick, choose the market matching " +
     'it; for a Yes/No prop the outcome is usually "Yes". (b) if the question is a generic ' +
-    "outright with NO named competitor (e.g. 'who wins the World Series', 'NBA MVP'), choose " +
-    "the single market with the highest p0 — the favourite. (c) if nothing fits, use index -1.";
+    "outright with NO named competitor (e.g. 'who wins the World Series', 'NBA MVP', 'Tour de " +
+    "France green jersey'), ALWAYS commit to the single market with the highest p0 — the " +
+    "favourite — rather than declining; a plausible best guess beats no answer. (c) only use " +
+    "index -1 if the list has nothing whatsoever to do with the question's subject.";
   const user = `Question: ${message}\n\nMarkets:\n${listing}`;
 
+  const r = await fetch(DEEPSEEK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": UA,
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" },
+      max_tokens: 60,
+    }),
+  });
+  if (!r.ok) return undefined;
+  const resp = await r.json();
+  const pick = JSON.parse(resp.choices[0].message.content);
+  const idx = parseInt(pick.index, 10);
+  if (Number.isNaN(idx) || idx >= candidates.length) return undefined;
+  if (idx < 0) return null;
+  return { index: idx, outcome: pick.outcome || candidates[idx].outcomes[0] };
+}
+
+// A generic-outright question ("who wins the World Series") sometimes gets a
+// flaky decline (index -1) from the model even though a clear favourite
+// exists in the list — confirmed by re-asking the identical question and
+// getting a valid pick most of the time. A real "nothing here matches"
+// case declines consistently, so retrying only on an explicit -1 (not on a
+// hard API/parse failure, which goes straight to the deterministic
+// fallback) fixes the flaky case without forcing a bad answer onto a
+// genuinely absent market.
+async function deepseekPick(message: string, candidates: Market[]) {
+  const key = Deno.env.get("DEEPSEEK_API_KEY");
+  if (!key) return fallbackPick(message, candidates);
   try {
-    const r = await fetch(DEEPSEEK_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0,
-        response_format: { type: "json_object" },
-        max_tokens: 60,
-      }),
-    });
-    if (!r.ok) return fallbackPick(message, candidates);
-    const resp = await r.json();
-    const pick = JSON.parse(resp.choices[0].message.content);
-    const idx = parseInt(pick.index, 10);
-    if (Number.isNaN(idx) || idx < 0 || idx >= candidates.length) return null;
-    return { index: idx, outcome: pick.outcome || candidates[idx].outcomes[0] };
+    let result = await deepseekPickOnce(message, candidates);
+    if (result === undefined) return fallbackPick(message, candidates);
+    if (result === null) result = await deepseekPickOnce(message, candidates);
+    return result ?? null;
   } catch {
     return fallbackPick(message, candidates);
   }
