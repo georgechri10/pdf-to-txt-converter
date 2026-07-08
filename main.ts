@@ -41,10 +41,14 @@ async function getJson(url: string) {
   return r.json();
 }
 
-// A market that has already resolved reports one outcome at ~1 and the rest
-// at ~0. Those aren't tradeable, so drop them from the candidate pool.
+// A market that has already resolved reports one outcome at EXACTLY 1 and
+// the rest at EXACTLY 0. A live in-play market can legitimately reach a
+// near-certain price (e.g. 0.9995) while a team is dominating but the game
+// hasn't ended — that's still open and tradeable, so only the literal
+// 0/1 case (confirmed against many closed markets, which always report
+// exact 0/1) means "already decided, no longer tradeable."
 function isSettled(prices: number[]): boolean {
-  return prices.some((p) => p >= 0.9995 || p <= 0.0005);
+  return prices.some((p) => p <= 0 || p >= 1);
 }
 
 // Broadcast/novelty "what will the commentators say" markets exist for every
@@ -61,7 +65,7 @@ function isNoveltyMarket(eventTitle: string, question: string): boolean {
 // Rank candidates by token overlap with the question so the relevant markets
 // survive the cap even when a single event contains dozens of sub-markets
 // (Golden Boot has 80, MVP has 51, ...).
-const MAX_CANDIDATES = 40;
+const MAX_CANDIDATES = 60;
 function rank(message: string, candidates: Market[]): Market[] {
   const q = tokens(message);
   return candidates
@@ -69,9 +73,16 @@ function rank(message: string, candidates: Market[]): Market[] {
       const ct = tokens(`${c.question} ${c.event} ${c.outcomes.join(" ")}`);
       let score = 0;
       for (const w of q) if (ct.has(w)) score++;
-      return { c, score };
+      // A generic outright ("who wins the world cup") matches every
+      // sibling award/stage event equally on shared words like "world
+      // cup", so plain overlap can't tell "World Cup Winner" apart from
+      // "World Cup: Golden Boot Winner" or "...Reach Semifinals". Prefer
+      // the event whose own title has fewer extra qualifier words — the
+      // main outright market's title is reliably the shortest.
+      const eventWords = tokens(c.event).size;
+      return { c, score, eventWords };
     })
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => b.score - a.score || a.eventWords - b.eventWords)
     .slice(0, MAX_CANDIDATES)
     .map((x) => x.c);
 }
@@ -134,7 +145,10 @@ async function expandQueries(message: string): Promise<string[]> {
 // The base event IS found by search, so once we have its slug we can fetch
 // the sibling directly instead of guessing further search phrasings.
 const PROP_HINT =
-  /\b(over|under|o\/u|total|totals|corner|card|handicap|spread|advance|prop|props|both teams|btts)\b/i;
+  /\b(over|under|o\/u|total|totals|corner|card|handicap|spread|advance|prop|props|both teams|btts|exact score|score|half|halftime|half-time|extra time|penalt(y|ies)|first (team )?to score)\b/i;
+// A point-spread question is often written as bare notation ("France -2.5"
+// vs Morocco) with no describing word at all — catch that shape too.
+const SPREAD_NOTATION = /[+-]\d+(\.\d)?\b/;
 
 async function fetchMoreMarketsEvent(slug: string) {
   try {
@@ -149,7 +163,33 @@ async function fetchMoreMarketsEvent(slug: string) {
   }
 }
 
-type GammaEvent = { title?: string; slug?: string; markets?: unknown[] };
+// Beyond "<slug>-more-markets", a match also has sibling events (halftime
+// result, exact score, first team to score, ...) grouped by a shared gameId
+// that Polymarket exposes directly on the search result — no extra lookup
+// needed to discover it. These two families cover different sibling sets
+// (confirmed live: "-more-markets" carries spreads/totals/advance/OT/pens;
+// game_id carries halftime/second-half/exact-score/first-to-score), so both
+// are fetched.
+async function fetchGameSiblingEvents(gameId: string): Promise<GammaEvent[]> {
+  try {
+    const data = await getJson(
+      `https://gamma-api.polymarket.com/events?${new URLSearchParams({
+        game_id: gameId,
+        limit: "50",
+      })}`,
+    );
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+type GammaEvent = {
+  title?: string;
+  slug?: string;
+  markets?: unknown[];
+  gameId?: string;
+};
 
 // Fetches run concurrently (for speed), but every result is merged into the
 // candidate list in a fixed, query-defined order — never in network-arrival
@@ -176,10 +216,12 @@ async function searchMarkets(message: string): Promise<Market[]> {
   const seen = new Set<string>();
   const candidates: Market[] = [];
   const eventTitleBySlug = new Map<string, string>();
+  const gameIdBySlug = new Map<string, string>();
 
   function ingest(event: GammaEvent) {
     if (event.slug && !eventTitleBySlug.has(event.slug)) {
       eventTitleBySlug.set(event.slug, event.title ?? "");
+      if (event.gameId) gameIdBySlug.set(event.slug, event.gameId);
     }
     for (const m of (event.markets ?? []) as Record<string, unknown>[]) {
       const mid = String(m.id);
@@ -216,13 +258,16 @@ async function searchMarkets(message: string): Promise<Market[]> {
   const perQueryEvents = await Promise.all(queries.map(fetchEvents));
   perQueryEvents.forEach((events) => events.forEach(ingest));
 
-  if (PROP_HINT.test(message) || !candidates.length) {
+  if (
+    PROP_HINT.test(message) || SPREAD_NOTATION.test(message) ||
+    !candidates.length
+  ) {
     // Rank candidate event slugs by title relevance to the question — not by
     // discovery order — so an off-topic query (an election, a weather event)
     // that happened to surface first can't starve the actual match's slug
     // out of the capped set of "more markets" lookups.
     const qTokens = tokens(message);
-    const slugs = Array.from(eventTitleBySlug.entries())
+    const rankedSlugs = Array.from(eventTitleBySlug.entries())
       .map(([slug, title]) => {
         const tTokens = tokens(title);
         let score = 0;
@@ -232,8 +277,17 @@ async function searchMarkets(message: string): Promise<Market[]> {
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
       .map((x) => x.slug);
-    const more = await Promise.all(slugs.map(fetchMoreMarketsEvent));
+
+    const more = await Promise.all(rankedSlugs.map(fetchMoreMarketsEvent));
     more.forEach((event) => event && ingest(event));
+
+    const gameIds = Array.from(
+      new Set(rankedSlugs.map((s) => gameIdBySlug.get(s)).filter(Boolean)),
+    ) as string[];
+    const siblingGroups = await Promise.all(
+      gameIds.map(fetchGameSiblingEvents),
+    );
+    siblingGroups.forEach((events) => events.forEach(ingest));
   }
 
   return rank(message, candidates);
