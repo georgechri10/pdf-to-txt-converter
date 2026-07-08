@@ -47,6 +47,17 @@ function isSettled(prices: number[]): boolean {
   return prices.some((p) => p >= 0.9995 || p <= 0.0005);
 }
 
+// Broadcast/novelty "what will the commentators say" markets exist for every
+// match and are stuffed with the same team names as the real match-winner
+// market. Their sheer volume (20-30 per game) lets them out-score the market
+// a user actually wants under plain token overlap, burying it. These are
+// never what "the odds of an event" means, so drop the whole family.
+function isNoveltyMarket(eventTitle: string, question: string): boolean {
+  return /announcers? say|broadcast(er)?s? say/i.test(
+    `${eventTitle} ${question}`,
+  );
+}
+
 // Rank candidates by token overlap with the question so the relevant markets
 // survive the cap even when a single event contains dozens of sub-markets
 // (Golden Boot has 80, MVP has 51, ...).
@@ -87,10 +98,15 @@ async function expandQueries(message: string): Promise<string[]> {
           {
             role: "system",
             content:
-              "Rewrite a sports betting question into up to 2 short search queries " +
-              "for a prediction market. Add the league/competition/sport name you can " +
-              "infer (e.g. 'World Series' -> 'MLB World Series champion'; 'the Ashes' " +
-              "-> 'cricket Ashes winner'). Keep proper nouns (teams, players). " +
+              "Rewrite a sports betting question into up to 3 short search queries for a " +
+              "prediction market's fuzzy text search. ALWAYS include one bare query that " +
+              "is ONLY the competitor names (teams/players) with the full official name " +
+              "(e.g. 'USA' -> 'United States') and nothing else — no 'winner', 'vs', " +
+              "'over/under', 'to advance', or other descriptive words, since those extra " +
+              "words can bury the exact match under unrelated results. Then, separately, " +
+              "add up to 2 more queries with the league/competition you can infer (e.g. " +
+              "'World Series' -> 'MLB World Series champion'; 'the Ashes' -> 'cricket " +
+              "Ashes winner') to help find props/totals/awards. " +
               'Reply ONLY with compact JSON {"queries": ["..."]}.',
           },
           { role: "user", content: message },
@@ -112,55 +128,114 @@ async function expandQueries(message: string): Promise<string[]> {
   }
 }
 
+// Match-level prop/totals/advance markets live under a sibling event named
+// "<slug>-more-markets" that Polymarket's text search does not surface no
+// matter how the query is phrased (verified against several live matches).
+// The base event IS found by search, so once we have its slug we can fetch
+// the sibling directly instead of guessing further search phrasings.
+const PROP_HINT =
+  /\b(over|under|o\/u|total|totals|corner|card|handicap|spread|advance|prop|props|both teams|btts)\b/i;
+
+async function fetchMoreMarketsEvent(slug: string) {
+  try {
+    const data = await getJson(
+      `https://gamma-api.polymarket.com/events?${new URLSearchParams({
+        slug: `${slug}-more-markets`,
+      })}`,
+    );
+    return Array.isArray(data) ? data[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+type GammaEvent = { title?: string; slug?: string; markets?: unknown[] };
+
+// Fetches run concurrently (for speed), but every result is merged into the
+// candidate list in a fixed, query-defined order — never in network-arrival
+// order. Otherwise which duplicate-scoring market ends up first (and so gets
+// shown to the LLM first) varies from request to request, which combined
+// with the model's own point-in-time variance made identical questions
+// occasionally resolve to different — or no — markets.
+async function fetchEvents(query: string): Promise<GammaEvent[]> {
+  if (!query) return [];
+  const url = `${GAMMA_SEARCH}?${new URLSearchParams({
+    q: query,
+    limit_per_type: "20",
+    events_status: "active",
+  })}`;
+  try {
+    const data = await getJson(url);
+    return data.events ?? [];
+  } catch {
+    return [];
+  }
+}
+
 async function searchMarkets(message: string): Promise<Market[]> {
   const seen = new Set<string>();
   const candidates: Market[] = [];
+  const eventTitleBySlug = new Map<string, string>();
 
-  async function collect(query: string) {
-    if (!query) return;
-    const url = `${GAMMA_SEARCH}?${new URLSearchParams({
-      q: query,
-      limit_per_type: "20",
-      events_status: "active",
-    })}`;
-    let data;
-    try {
-      data = await getJson(url);
-    } catch {
-      return;
+  function ingest(event: GammaEvent) {
+    if (event.slug && !eventTitleBySlug.has(event.slug)) {
+      eventTitleBySlug.set(event.slug, event.title ?? "");
     }
-    for (const event of data.events ?? []) {
-      for (const m of event.markets ?? []) {
-        const mid = String(m.id);
-        if (seen.has(mid) || m.closed || !m.enableOrderBook) continue;
-        let outcomes: string[], prices: number[];
-        try {
-          outcomes = JSON.parse(m.outcomes ?? "[]");
-          prices = (JSON.parse(m.outcomePrices ?? "[]") as string[]).map(Number);
-        } catch {
-          continue;
-        }
-        if (outcomes.length < 2 || outcomes.length !== prices.length) continue;
-        if (isSettled(prices)) continue;
-        seen.add(mid);
-        candidates.push({
-          id: mid,
-          event: event.title ?? "",
-          question: m.question ?? "",
-          outcomes,
-          prices,
-          bestBid: toFloat(m.bestBid),
-          bestAsk: toFloat(m.bestAsk),
-        });
+    for (const m of (event.markets ?? []) as Record<string, unknown>[]) {
+      const mid = String(m.id);
+      if (seen.has(mid) || m.closed || !m.enableOrderBook) continue;
+      let outcomes: string[], prices: number[];
+      try {
+        outcomes = JSON.parse((m.outcomes as string) ?? "[]");
+        prices = (JSON.parse((m.outcomePrices as string) ?? "[]") as string[])
+          .map(Number);
+      } catch {
+        continue;
       }
+      if (outcomes.length < 2 || outcomes.length !== prices.length) continue;
+      if (isSettled(prices)) continue;
+      if (isNoveltyMarket(event.title ?? "", (m.question as string) ?? "")) {
+        continue;
+      }
+      seen.add(mid);
+      candidates.push({
+        id: mid,
+        event: event.title ?? "",
+        question: (m.question as string) ?? "",
+        outcomes,
+        prices,
+        bestBid: toFloat(m.bestBid),
+        bestAsk: toFloat(m.bestAsk),
+      });
     }
   }
 
-  const queries = await expandQueries(message);
-  await Promise.all(queries.map(collect));
-  if (!candidates.length && !queries.includes(message.trim())) {
-    await collect(message.trim());
+  let queries = await expandQueries(message);
+  if (!queries.includes(message.trim())) queries = [...queries, message.trim()];
+
+  const perQueryEvents = await Promise.all(queries.map(fetchEvents));
+  perQueryEvents.forEach((events) => events.forEach(ingest));
+
+  if (PROP_HINT.test(message) || !candidates.length) {
+    // Rank candidate event slugs by title relevance to the question — not by
+    // discovery order — so an off-topic query (an election, a weather event)
+    // that happened to surface first can't starve the actual match's slug
+    // out of the capped set of "more markets" lookups.
+    const qTokens = tokens(message);
+    const slugs = Array.from(eventTitleBySlug.entries())
+      .map(([slug, title]) => {
+        const tTokens = tokens(title);
+        let score = 0;
+        for (const w of qTokens) if (tTokens.has(w)) score++;
+        return { slug, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map((x) => x.slug);
+    const more = await Promise.all(slugs.map(fetchMoreMarketsEvent));
+    more.forEach((event) => event && ingest(event));
   }
+
   return rank(message, candidates);
 }
 
@@ -192,7 +267,9 @@ async function deepseekPick(message: string, candidates: Market[]) {
 
   const listing = candidates
     .map((c, i) =>
-      `[${i}] event: ${c.event} | market: ${c.question} | outcomes: ${JSON.stringify(c.outcomes)} | p0: ${c.prices[0]}`
+      `[${i}] event: ${c.event} | market: ${c.question} | outcomes: ${
+        JSON.stringify(c.outcomes)
+      } | p0: ${c.prices[0]}`
     )
     .join("\n");
   const system =
@@ -204,7 +281,7 @@ async function deepseekPick(message: string, candidates: Market[]) {
     "X a draw. Reply ONLY with compact JSON: " +
     '{"index": <int>, "outcome": "<exact outcome string the user is asking about>"}. ' +
     "Rules: (a) if the question names a specific competitor/pick, choose the market matching " +
-    "it; for a Yes/No prop the outcome is usually \"Yes\". (b) if the question is a generic " +
+    'it; for a Yes/No prop the outcome is usually "Yes". (b) if the question is a generic ' +
     "outright with NO named competitor (e.g. 'who wins the World Series', 'NBA MVP'), choose " +
     "the single market with the highest p0 — the favourite. (c) if nothing fits, use index -1.";
   const user = `Question: ${message}\n\nMarkets:\n${listing}`;
@@ -274,7 +351,9 @@ function formatOdds(market: Market, outcome: string): string {
   }
 
   let line = `${market.question || market.event} — ` +
-    `${outcomes[oi]} ${Math.round(p * 100)}c / ${outcomes[otherI]} ${Math.round(pOther * 100)}c`;
+    `${outcomes[oi]} ${Math.round(p * 100)}c / ${outcomes[otherI]} ${
+      Math.round(pOther * 100)
+    }c`;
   const back = decimal(oAsk); // you buy at the ask
   const lay = decimal(oBid); // you sell at the bid
   if (back && lay) line += ` · back ${back.toFixed(2)} lay ${lay.toFixed(2)}`;
@@ -306,7 +385,9 @@ Deno.serve(async (req: Request) => {
       const body = await req.json().catch(() => ({}));
       const message = String(body.message ?? "").trim();
       if (!message) {
-        return json({ error: "Ask about an event, e.g. 'England vs Mexico 1'." }, 400);
+        return json({
+          error: "Ask about an event, e.g. 'England vs Mexico 1'.",
+        }, 400);
       }
       const candidates = await searchMarkets(message);
       if (!candidates.length) return json({ answer: "No market found." });
